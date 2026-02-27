@@ -1,0 +1,2 @@
+# tez hk. algoritma
+## başlık 

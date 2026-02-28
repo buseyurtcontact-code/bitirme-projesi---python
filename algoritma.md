@@ -102,7 +102,12 @@ Gerçek vs Tahmin grafiği çiz.
 
 Sonuçlar anlamlı mı, değilse ADIM 2 ye git 
 
-
+### Açıklama
+- **Daire (Başlangıç/Bitiş):** sürecin giriş ve çıkış noktaları  
+- **Dikdörtgen:** işlem adımları (örneğin “Veri Toplama”)  
+- **Elmas (Decision):** karar noktası (“Sonuçlar anlamlı mı?”)  
+- **Oklar:** akış yönü
+- 
 ```mermaid
 flowchart TD
     A([Başlangıç]) --> B[Adım 1: Veri Toplama]
@@ -117,4 +122,4 @@ flowchart TD
     J --> K[Adım 10: Tahmin ve Performans]
     K --> L{Sonuçlar anlamlı mı?}
     L -->|Evet| M([Bitiş])
-    L -->|Hayır| C  
+    L -->|Hayır| C

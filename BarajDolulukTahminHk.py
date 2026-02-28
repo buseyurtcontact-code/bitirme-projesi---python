@@ -1,3 +1,6 @@
+# -------------------------------
+# KÜTÜPHANELER
+# -------------------------------
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,34 +11,16 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 
 # -------------------------------
-# deneme için rastgele veri üretmek
+# VERİ YÜKLEME VE TEMİZLEME
+# -------------------------------
+df = pd.read_csv("izmir_baraj_veri.csv")
+df["date"] = pd.to_datetime(df["date"])
+df = df.sort_values("date")
 
-np.random.seed(42)
-n_days = 365
-dates = pd.date_range(start="2025-01-01", periods=n_days)
+# Eksik değerleri doğrusal interpolasyon ile doldurma
+df.interpolate(method="linear", inplace=True)
 
-# Rastgele Mevsimsel trend (yaz-kış)
-seasonal_trend = 50 + 20*np.sin(2*np.pi*np.arange(n_days)/365)
-
-# Rastgele Haftalık döngü (hafta sonları biraz farklı) düzenlenecek
-weekly_cycle = 2 * np.sin(2*np.pi*np.arange(n_days)/7)
-
-# Rastgele yağış/kuraklık etkisi
-random_noise = np.random.normal(0, 5, n_days)
-
-# Rastgele Doluluk oranı
-doluluk = seasonal_trend + weekly_cycle + random_noise
-df = pd.DataFrame({"date": dates, "doluluk": doluluk})
-
-# VERİ TEMİZLEME VE FEATURE ENGINEERING
-
-#  Küçük boşluklar (1-2 gün) için doğrusal interpolasyon
-df['doluluk_linear'] = df['doluluk'].interpolate(method='linear', limit=2)
-
-#  Büyük boşluklar (3+ gün) için mevsimsel interpolasyon
-# Mevsimsel trend
-seasonal_trend = 50 + 20*np.sin(2*np.pi*np.arange(n_days)/365)
-
+# Aykırı değer temizleme
 df["daily_change"] = df["doluluk"].diff()
 max_daily_change = 10
 min_daily_change = -10
@@ -43,7 +28,9 @@ df["doluluk_cleaned"] = df["doluluk"].copy()
 df.loc[df["daily_change"] > max_daily_change, "doluluk_cleaned"] = df["doluluk"].shift(1) + max_daily_change
 df.loc[df["daily_change"] < min_daily_change, "doluluk_cleaned"] = df["doluluk"].shift(1) + min_daily_change
 
-# Lag ve hareketli ortalama
+# -------------------------------
+# FEATURE ENGINEERING
+# -------------------------------
 df["lag1"] = df["doluluk_cleaned"].shift(1)
 df["lag7"] = df["doluluk_cleaned"].shift(7)
 df["ma7"] = df["doluluk_cleaned"].rolling(window=7).mean()
@@ -55,9 +42,9 @@ features = ["lag1", "lag7", "ma7", "month", "season", "daily_change"]
 target = "doluluk_cleaned"
 
 # -------------------------------
-# SLIDING WINDOW
+# SLIDING WINDOW (LSTM uyumlu)
 # -------------------------------
-def create_sliding_window(data, features, target, window_size=7):
+def create_sliding_window_lstm(data, features, target, window_size=7):
     X, y = [], []
     for i in range(len(data) - window_size):
         X.append(data[features].iloc[i:i+window_size].values)
@@ -65,13 +52,14 @@ def create_sliding_window(data, features, target, window_size=7):
     return np.array(X), np.array(y).reshape(-1,1)
 
 window_size = 7
-X, y = create_sliding_window(df, features, target, window_size)
+X, y = create_sliding_window_lstm(df, features, target, window_size)
 
 # -------------------------------
 # NORMALİZASYON
 # -------------------------------
 scaler_X = MinMaxScaler()
 scaler_y = MinMaxScaler()
+
 n_samples, n_timesteps, n_features = X.shape
 X_reshaped = X.reshape(n_samples, n_timesteps*n_features)
 X_scaled = scaler_X.fit_transform(X_reshaped).reshape(n_samples, n_timesteps, n_features)
@@ -85,13 +73,14 @@ X_train, X_test = X_scaled[:train_size], X_scaled[train_size:]
 y_train, y_test = y_scaled[:train_size], y_scaled[train_size:]
 
 # -------------------------------
-# LSTM MODELİ
+# LSTM MODELİ (Dropout + Dense + EarlyStopping)
 # -------------------------------
 model = Sequential()
 model.add(LSTM(64, input_shape=(X_train.shape[1], X_train.shape[2])))
-model.add(Dropout(0.2))
-model.add(Dense(32, activation="relu"))
-model.add(Dense(1))
+model.add(Dropout(0.2))  # overfitting'i azaltır
+model.add(Dense(32, activation="relu"))  # ek gizli katman
+model.add(Dense(1))  # çıkış katmanı
+
 model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
 early_stop = EarlyStopping(patience=10, restore_best_weights=True)
@@ -127,5 +116,5 @@ plt.figure(figsize=(12,5))
 plt.plot(y_test_original, label="Gerçek")
 plt.plot(y_pred, label="Tahmin")
 plt.legend()
-plt.title("Gerçek vs Tahmin Doluluk Oranı (Simülasyon Verisi)")
+plt.title("Gerçek vs Tahmin Doluluk Oranı (LSTM + Dropout + Dense)")
 plt.show()

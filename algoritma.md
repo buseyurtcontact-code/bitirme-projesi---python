@@ -117,13 +117,4 @@ flowchart TD
     J --> K[Adım 10: Tahmin ve Performans]
     K --> L{Sonuçlar anlamlı mı?}
     L -->|Evet| M([Bitiş])
-    L -->|Hayır| C
-
-
-
-### Açıklama
-- **Daire (Başlangıç/Bitiş):** sürecin giriş ve çıkış noktaları.  
-- **Dikdörtgen:** işlem adımları (örneğin “Veri Toplama”).  
-- **Elmas (Decision):** karar noktası (“Sonuçlar anlamlı mı?”).  
-- **Oklar:** akış yönünü gösteriyor.  
- 
+    L -->|Hayır| C  

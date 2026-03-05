@@ -2,13 +2,19 @@
 
 ```mermaid
 flowchart TD
-    A[Read CSV File] --> B[Convert Date Column to Datetime]
-    B --> C[Sort Data by Date]
-    C --> D[Split Input (X) and Output (y)]
-    D --> E[Check Missing Values]
-    E --> F[Fill Small Gaps with Linear Interpolation]
-    F --> G[Fill Large Gaps with Monthly Mean]
-    G --> H[Redefine X and y]
-    H --> I[Print First 5 Rows of X]
-    H --> J[Print First 5 Rows of y]
-    H --> K[Print First 20 Rows of Dataset]
+    A([Başlangıç]) --> B[Adım 1: CSV Dosyasını Oku]
+    B --> C[Adım 2: Tarih Kolonunu Datetime Formatına Çevir]
+    C --> D[Adım 3: Verileri Tarihe Göre Sırala]
+    D --> E[Adım 4: Girdi (X) ve Çıktı (y) Ayır]
+    E --> F[Adım 5: Eksik Verileri Kontrol Et]
+    F --> G[Adım 6: Küçük Boşlukları Lineer Interpolasyon ile Doldur]
+    G --> H[Adım 7: Büyük Boşlukları Aylık Ortalama ile Doldur]
+    H --> I[Adım 8: X ve y Tekrar Tanımla]
+    I --> J[Adım 9: X'in İlk 5 Satırını Yazdır]
+    I --> K[Adım 10: y'nin İlk 5 Satırını Yazdır]
+    I --> L[Adım 11: Veri Setinin İlk 20 Satırını Yazdır]
+    L --> M([Bitiş])
+```
+
+
+

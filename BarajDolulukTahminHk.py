@@ -10,17 +10,13 @@ import tensorflow as tf   # Derin öğrenme için kullanılan kütüphane.
 from tensorflow.keras.models import Sequential   # Yapay sinir ağı modeli kurmak için.
 from tensorflow.keras.layers import LSTM, Dense, Dropout  # LSTM ve diğer katmanlar için.
 
-import pandas as pd       # Pandas tekrar eklenmiş, aslında yukarıda zaten vardı.
-
-# Doğru dosya yolu
+# dosya yolu
 data = pd.read_csv(r"C:\Users\acer\Desktop\310.py\tezzz.py\seattle-weather.csv")  
 # CSV dosyasını bilgisayardan okuyoruz ve 'data' isimli tabloya yüklüyoruz.
 
-# Tarih kolonunu datetime formatına çevir
 data['date'] = pd.to_datetime(data['date'])  
 # 'date' sütununu tarih formatına çeviriyoruz ki üzerinde zaman işlemleri yapabilelim.
 
-# Tarihe göre sırala
 data = data.sort_values('date')  
 # Verileri tarihe göre sıralıyoruz (eskiden yeniye doğru).
 

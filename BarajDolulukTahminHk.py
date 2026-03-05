@@ -1,71 +1,82 @@
 # -*- coding: utf-8 -*-   # Türkçe karakterlerin sorunsuz çalışması için dosya kodlamasını ayarlıyoruz.
+# İzmir baraj doluluk oranı tahmini için örnek LSTM kodu
+# Şimdilik Seattle verisiyle yağış tahmini yapıyoruz (sayısal hedef)
 
 import numpy as np        # Sayısal hesaplamalar için kullanılan kütüphane.
 import pandas as pd       # Veri analizi ve tablo işlemleri için kullanılan kütüphane.
 import matplotlib.pyplot as plt  # Grafik çizmek için kullanılan kütüphane.
-import seaborn as sns     # Daha şık grafikler çizmek için kullanılan kütüphane.
 from sklearn.preprocessing import MinMaxScaler  # Verileri ölçeklemek için.
-from sklearn.linear_model import LinearRegression  # Basit doğrusal regresyon modeli için.
-import tensorflow as tf   # Derin öğrenme için kullanılan kütüphane.
+from sklearn.model_selection import train_test_split  # Eğitim ve test verisini ayırmak için.
 from tensorflow.keras.models import Sequential   # Yapay sinir ağı modeli kurmak için.
 from tensorflow.keras.layers import LSTM, Dense, Dropout  # LSTM ve diğer katmanlar için.
 
-# dosya yolu
-data = pd.read_csv(r"C:\Users\acer\Desktop\310.py\tezzz.py\seattle-weather.csv")  
-# CSV dosyasını bilgisayardan okuyoruz ve 'data' isimli tabloya yüklüyoruz.
+# 1. Veri yükleme
+data = pd.read_csv(r"C:\Users\acer\Desktop\310.py\tezzz.py\seattle-weather.csv")  # CSV dosyasını okuyoruz.
+data['date'] = pd.to_datetime(data['date'])   # 'date' sütununu tarih formatına çeviriyoruz.
+data = data.sort_values('date').reset_index(drop=True)  # Verileri tarihe göre sıralıyoruz ve indexleri sıfırlıyoruz.
 
-data['date'] = pd.to_datetime(data['date'])  
-# 'date' sütununu tarih formatına çeviriyoruz ki üzerinde zaman işlemleri yapabilelim.
+# 2. Eksik veri doldurma
+data['month'] = data['date'].dt.month  # Her satır için ay bilgisini çıkarıyoruz.
+for col in ['precipitation', 'temp_max', 'temp_min', 'wind']:
+    data[col] = data[col].interpolate(method='linear')  # Küçük boşlukları lineer interpolasyon ile dolduruyoruz.
+    data[col] = data.groupby('month')[col].transform(lambda x: x.fillna(x.mean()))  # Büyük boşlukları aynı ayın ortalamasıyla dolduruyoruz.
 
-data = data.sort_values('date')  
-# Verileri tarihe göre sıralıyoruz (eskiden yeniye doğru).
+# 3. Girdi ve çıktı değişkenleri
+# ⚠️ Gerçek projede hedef: data['reservoir_percent'] olacak.
+# Şimdilik yağışı tahmin ediyoruz.
+X = data[['temp_max', 'temp_min', 'wind']].values  # Girdi değişkenleri: sıcaklıklar ve rüzgar.
+y = data['precipitation'].values  # Çıkış değişkeni: yağış miktarı.
 
-# Girdi (X) ve çıktı (y) ayır
-X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]  
-# Modelin kullanacağı giriş verileri: yağış, maksimum sıcaklık, minimum sıcaklık ve rüzgar.
-y = data['weather']  
-# Çıkış verisi: hava durumu (örneğin 'rain', 'drizzle', 'sun').
+# 4. Ölçekleme
+scaler_X = MinMaxScaler()  # Girdi verilerini ölçeklemek için.
+scaler_y = MinMaxScaler()  # Çıkış verisini ölçeklemek için.
+X_scaled = scaler_X.fit_transform(X)  # Girdi verilerini 0-1 aralığına ölçekliyoruz.
+y_scaled = scaler_y.fit_transform(y.reshape(-1, 1))  # Çıkış verisini 0-1 aralığına ölçekliyoruz.
 
-'''
-çıktısı:
-   precipitation  temp_max  temp_min  wind precipitation=yağış miktarı
-0            0.0      12.8       5.0   4.7
-1           10.9      10.6       2.8   4.5
-2            0.8      11.7       7.2   2.3
-3           20.3      12.2       5.6   4.7
-4            1.3       8.9       2.8   6.1
-0    drizzle
-1       rain
-2       rain
-3       rain
-4       rain
-Name: weather, dtype: object
-'''
-# Yukarıdaki örnek çıktıda X tablosu sayısal değerleri, y ise hava durumu etiketlerini gösteriyor.
+# 5. Zaman serisi için pencere oluşturma (ör. son 30 gün)
+WINDOW = 30  # Kaç gün geriye bakılacağını belirliyoruz.
+def create_sequences(X, y, window):
+    Xs, ys = [], []
+    for i in range(len(X) - window):
+        Xs.append(X[i:i+window])   # Son 30 günün verilerini giriş olarak alıyoruz.
+        ys.append(y[i+window])     # 31. günün değerini çıkış olarak alıyoruz.
+    return np.array(Xs), np.array(ys)
 
-# Küçük boşluklar için lineer interpolasyon
-data[['precipitation','temp_max','temp_min','wind']] = (
-    data[['precipitation','temp_max','temp_min','wind']].interpolate(method='linear')
+X_seq, y_seq = create_sequences(X_scaled, y_scaled, WINDOW)  # Fonksiyonu çalıştırıyoruz.
+# X_seq.shape → (örnek sayısı, 30 gün, 3 özellik)
+
+# 6. Train/test split (shuffle=False → zaman serisi bozulmasın)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_seq, y_seq, test_size=0.2, shuffle=False  # Verilerin %80'i eğitim, %20'si test için ayrılıyor.
 )
-# Eğer verilerde küçük eksikler varsa, onları doğrusal (lineer) yöntemle dolduruyoruz.
 
-# Büyük boşluklar için mevsimsel ortalama doldurma
-data['month'] = data['date'].dt.month  
-# Her satır için ay bilgisini çıkarıyoruz.
-for col in ['precipitation','temp_max','temp_min','wind']:
-    data[col] = data.groupby('month')[col].transform(lambda x: x.fillna(x.mean()))
-# Eğer büyük boşluklar varsa, aynı ayın ortalama değerleriyle dolduruyoruz.
-# Örneğin Ocak ayındaki eksik değerler Ocak ortalamasıyla tamamlanıyor.
+# 7. LSTM Modeli
+model = Sequential([  # Modeli sırayla katmanlar ekleyerek tanımlıyoruz.
+    LSTM(64, return_sequences=True, input_shape=(WINDOW, X.shape[1])),  # İlk LSTM katmanı, 64 nöron.
+    Dropout(0.2),  # %20 dropout → aşırı öğrenmeyi azaltmak için.
+    LSTM(32),  # İkinci LSTM katmanı, 32 nöron.
+    Dense(1)   # Çıkış katmanı → tek değer (yağış veya baraj doluluk %).
+])
+model.compile(optimizer='adam', loss='mse')  # Modeli derliyoruz, kayıp fonksiyonu MSE.
+model.summary()  # Modelin yapısını ekrana yazdırıyoruz.
 
-# Güncel X ve y tekrar tanımla
-X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]  
-# Eksikleri doldurduktan sonra giriş verilerini tekrar tanımlıyoruz.
-y = data['weather']  
-# Çıkış verisini tekrar tanımlıyoruz.
+# 8. Model eğitimi
+history = model.fit(
+    X_train, y_train,  # Eğitim verisi
+    epochs=50,         # 50 kez tüm veri üzerinde eğitim yapılacak.
+    batch_size=32,     # Her seferde 32 örnek kullanılacak.
+    validation_data=(X_test, y_test)  # Test verisi doğrulama için kullanılacak.
+)
 
-print(X.head())  
-# İlk 5 satırdaki giriş verilerini ekrana yazdırıyoruz.
-print(y.head())  
-# İlk 5 satırdaki çıkış verilerini ekrana yazdırıyoruz.
-print(data.head(20))  
-# Tablonun ilk 20 satırını ekrana yazdırıyoruz.
+# 9. Tahmin
+y_pred_scaled = model.predict(X_test)  # Test verisi üzerinde tahmin yapıyoruz.
+y_pred = scaler_y.inverse_transform(y_pred_scaled)  # Tahminleri ölçekten geri çeviriyoruz.
+y_actual = scaler_y.inverse_transform(y_test)  # Gerçek değerleri ölçekten geri çeviriyoruz.
+
+# 10. Görselleştirme
+plt.figure(figsize=(12, 6))  # Grafik boyutunu ayarlıyoruz.
+plt.plot(y_actual, label='Gerçek')  # Gerçek değerleri çiziyoruz.
+plt.plot(y_pred, label='Tahmin')    # Tahmin edilen değerleri çiziyoruz.
+plt.legend()  # Grafik üzerine açıklama ekliyoruz.
+plt.title("Yağış Tahmini (Gerçek Projede: Baraj Doluluk %)")  # Başlık ekliyoruz.
+plt.show()  # Grafiği ekrana gösteriyoruz.

@@ -1,29 +1,35 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-   # Türkçe karakterlerin sorunsuz çalışması için dosya kodlamasını ayarlıyoruz.
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.linear_model import LinearRegression
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+import numpy as np        # Sayısal hesaplamalar için kullanılan kütüphane.
+import pandas as pd       # Veri analizi ve tablo işlemleri için kullanılan kütüphane.
+import matplotlib.pyplot as plt  # Grafik çizmek için kullanılan kütüphane.
+import seaborn as sns     # Daha şık grafikler çizmek için kullanılan kütüphane.
+from sklearn.preprocessing import MinMaxScaler  # Verileri ölçeklemek için.
+from sklearn.linear_model import LinearRegression  # Basit doğrusal regresyon modeli için.
+import tensorflow as tf   # Derin öğrenme için kullanılan kütüphane.
+from tensorflow.keras.models import Sequential   # Yapay sinir ağı modeli kurmak için.
+from tensorflow.keras.layers import LSTM, Dense, Dropout  # LSTM ve diğer katmanlar için.
 
-import pandas as pd
+import pandas as pd       # Pandas tekrar eklenmiş, aslında yukarıda zaten vardı.
 
 # Doğru dosya yolu
-data = pd.read_csv(r"C:\Users\acer\Desktop\310.py\tezzz.py\seattle-weather.csv")
+data = pd.read_csv(r"C:\Users\acer\Desktop\310.py\tezzz.py\seattle-weather.csv")  
+# CSV dosyasını bilgisayardan okuyoruz ve 'data' isimli tabloya yüklüyoruz.
 
 # Tarih kolonunu datetime formatına çevir
-data['date'] = pd.to_datetime(data['date'])
+data['date'] = pd.to_datetime(data['date'])  
+# 'date' sütununu tarih formatına çeviriyoruz ki üzerinde zaman işlemleri yapabilelim.
 
 # Tarihe göre sırala
-data = data.sort_values('date')
+data = data.sort_values('date')  
+# Verileri tarihe göre sıralıyoruz (eskiden yeniye doğru).
 
 # Girdi (X) ve çıktı (y) ayır
-X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]
-y = data['weather']
+X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]  
+# Modelin kullanacağı giriş verileri: yağış, maksimum sıcaklık, minimum sıcaklık ve rüzgar.
+y = data['weather']  
+# Çıkış verisi: hava durumu (örneğin 'rain', 'drizzle', 'sun').
+
 '''
 çıktısı:
    precipitation  temp_max  temp_min  wind precipitation=yağış miktarı
@@ -39,22 +45,31 @@ y = data['weather']
 4       rain
 Name: weather, dtype: object
 '''
+# Yukarıdaki örnek çıktıda X tablosu sayısal değerleri, y ise hava durumu etiketlerini gösteriyor.
 
 # Küçük boşluklar için lineer interpolasyon
 data[['precipitation','temp_max','temp_min','wind']] = (
     data[['precipitation','temp_max','temp_min','wind']].interpolate(method='linear')
 )
+# Eğer verilerde küçük eksikler varsa, onları doğrusal (lineer) yöntemle dolduruyoruz.
 
 # Büyük boşluklar için mevsimsel ortalama doldurma
-data['month'] = data['date'].dt.month
+data['month'] = data['date'].dt.month  
+# Her satır için ay bilgisini çıkarıyoruz.
 for col in ['precipitation','temp_max','temp_min','wind']:
     data[col] = data.groupby('month')[col].transform(lambda x: x.fillna(x.mean()))
+# Eğer büyük boşluklar varsa, aynı ayın ortalama değerleriyle dolduruyoruz.
+# Örneğin Ocak ayındaki eksik değerler Ocak ortalamasıyla tamamlanıyor.
 
 # Güncel X ve y tekrar tanımla
-X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]
-y = data['weather']
+X = data[['precipitation', 'temp_max', 'temp_min', 'wind']]  
+# Eksikleri doldurduktan sonra giriş verilerini tekrar tanımlıyoruz.
+y = data['weather']  
+# Çıkış verisini tekrar tanımlıyoruz.
 
-print(X.head())
-print(y.head())
-print(data.head(20))
-  
+print(X.head())  
+# İlk 5 satırdaki giriş verilerini ekrana yazdırıyoruz.
+print(y.head())  
+# İlk 5 satırdaki çıkış verilerini ekrana yazdırıyoruz.
+print(data.head(20))  
+# Tablonun ilk 20 satırını ekrana yazdırıyoruz.

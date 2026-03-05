@@ -1,0 +1,14 @@
+## Data Preprocessing Workflow
+
+```mermaid
+flowchart TD
+    A[Read CSV File] --> B[Convert Date Column to Datetime]
+    B --> C[Sort Data by Date]
+    C --> D[Split Input (X) and Output (y)]
+    D --> E[Check Missing Values]
+    E --> F[Fill Small Gaps with Linear Interpolation]
+    F --> G[Fill Large Gaps with Monthly Mean]
+    G --> H[Redefine X and y]
+    H --> I[Print First 5 Rows of X]
+    H --> J[Print First 5 Rows of y]
+    H --> K[Print First 20 Rows of Dataset]

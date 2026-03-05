@@ -1,4 +1,6 @@
-## Data Preprocessing Workflow
+# Veri Ön İşleme Akış Şeması
+
+Aşağıdaki diyagram, Python kodunun adım adım işleyişini göstermektedir:
 
 ```mermaid
 flowchart TD
@@ -14,7 +16,5 @@ flowchart TD
     I --> K[Adım 10: y'nin İlk 5 Satırını Yazdır]
     I --> L[Adım 11: Veri Setinin İlk 20 Satırını Yazdır]
     L --> M([Bitiş])
-```
-
 
 

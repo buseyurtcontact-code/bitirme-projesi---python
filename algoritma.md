@@ -111,15 +111,15 @@ Sonuçlar anlamlı mı, değilse ADIM 2 ye git
 ```mermaid
 flowchart TD
     A([Başlangıç]) --> B[Adım 1: Veri Toplama]
-    B --> C[Adım 2: Veri Ön İşleme]
-    C --> D[Adım 3: Feature Engineering]
-    D --> E[Adım 4: Train-Test Bölme]
-    E --> F[Adım 5: Normalizasyon]
-    F --> G[Adım 6: Baseline Model]
-    G --> H[Adım 7: LSTM Model Tasarımı]
-    H --> I[Adım 8: Model Derleme]
-    I --> J[Adım 9: Model Eğitimi]
-    J --> K[Adım 10: Tahmin ve Performans]
+    B --> C[Adım 2: Veri Temizleme ve Ön İşleme]
+    C --> D[Adım 3: Özellik Mühendisliği]
+    D --> E[Adım 4: Train-Test Ayrımı]
+    E --> F[Adım 5: Ölçekleme]
+    F --> G[Adım 6: Model Mimarisi - Dense]
+    G --> H[Adım 7: Model Derleme]
+    H --> I[Adım 8: Model Eğitimi]
+    I --> J[Adım 9: Tahmin ve Performans]
+    J --> K[Adım 10: Görselleştirme]
     K --> L{Sonuçlar anlamlı mı?}
     L -->|Evet| M([Bitiş])
     L -->|Hayır| C

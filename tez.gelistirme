@@ -1,0 +1,391 @@
+import argparse
+import json
+import os
+import random
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.models import Sequential
+
+# =========================
+# ARGUMENT PARSING
+# =========================
+
+parser = argparse.ArgumentParser(description="Train dense models for dam fill level prediction.")
+
+parser.add_argument(
+    "--dams",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated list of dams to train. Defaults to all. "
+        "Example: --dams \"Urkmez,Tahtali\""
+    )
+)
+
+args = parser.parse_args()
+
+# =========================
+# CONFIG
+# =========================
+
+RANDOM_SEED = 1
+
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+tf.random.set_seed(RANDOM_SEED)
+
+ALL_DAMS = [
+    "Guzelhisar",
+    "Balcova",
+    "Gordes",
+    "Tahtali",
+    "Urkmez",
+    "AlacatiKutluAktas",
+]
+
+WEATHER_PREFIXES = [
+    "tmax_", "tmin_", "tavg_", "hum_", "wind_", "sun_", "evap_", "prcp_"
+]
+
+# Guzelhisar cycles naturally (not municipal), so shorter lags are appropriate
+GUZELHISAR_LAG_DAYS = [1, 7, 30]
+DEFAULT_LAG_DAYS    = [1, 7, 14, 30, 60, 90]
+
+TEST_START_YEAR = 2023
+
+FEATURE_CONFIG_PATH = "feature_config.json"
+
+DAM_TEST_END = {
+    "Guzelhisar": "2025-11-19",  # data removed from source after this date
+}
+
+# Resolve which dams to run
+if args.dams:
+    requested = [d.strip() for d in args.dams.split(",")]
+    invalid   = [d for d in requested if d not in ALL_DAMS]
+    if invalid:
+        print(f"[WARNING] Unknown dam(s) ignored: {invalid}")
+    DAMS = [d for d in requested if d in ALL_DAMS]
+    if not DAMS:
+        print("[ERROR] No valid dams specified. Exiting.")
+        exit(1)
+else:
+    DAMS = ALL_DAMS
+
+OUT_DIR = f"results_test{TEST_START_YEAR}"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+print(f"Test start year: {TEST_START_YEAR}")
+print(f"Dams           : {DAMS}")
+print(f"Output dir     : {OUT_DIR}\n")
+
+# =========================
+# LOAD FEATURE CONFIG
+# =========================
+
+with open(FEATURE_CONFIG_PATH, "r") as f:
+    FEATURE_CONFIG = json.load(f)
+
+print(f"Loaded feature config for dams: {list(FEATURE_CONFIG.keys())}\n")
+
+# =========================
+# LOAD RAW DATA
+# =========================
+
+df_raw = pd.read_csv("son_merged.csv")
+df_raw["date"] = pd.to_datetime(df_raw["Date"], dayfirst=True)
+df_raw = df_raw.sort_values("date").set_index("date")
+df_raw = df_raw.drop(columns=["Date"], errors="ignore")
+df_raw = df_raw.dropna(axis=1, how="all")
+
+# =========================
+# DATA QUALITY CONTROL
+# =========================
+
+# Step 1: Precipitation and evaporation: NaN -> 0 (no measurement = nothing happened)
+prcp_all = [c for c in df_raw.columns if c.startswith("prcp_")]
+evap_all = [c for c in df_raw.columns if c.startswith("evap_")]
+df_raw[prcp_all] = df_raw[prcp_all].fillna(0)
+df_raw[evap_all] = df_raw[evap_all].fillna(0)
+
+print(f"Raw data: {len(df_raw)} rows, {len(df_raw.columns)} columns")
+print(f"Date range: {df_raw.index.min().date()} -> {df_raw.index.max().date()}\n")
+
+doluluk_cols = [c for c in df_raw.columns if "DolulukOrani" in c]
+
+# Step 2: Nullify physically impossible values (> 100%)
+for col in doluluk_cols:
+    n_bad = (df_raw[col] > 100).sum()
+    if n_bad > 0:
+        print(f"  [{col}] Nullifying {n_bad} value(s) over 100%")
+    df_raw.loc[df_raw[col] > 100, col] = np.nan
+
+# Step 3: Interpolate all nullified values smoothly
+df_raw[doluluk_cols] = df_raw[doluluk_cols].interpolate(method="time")
+
+print()
+
+# =========================
+# TRAIN ONE MODEL PER DAM
+# =========================
+
+results_summary = []
+
+for dam in DAMS:
+    target_col = f"{dam}DolulukOrani"
+
+    if target_col not in df_raw.columns:
+        print(f"[{dam}] Target column '{target_col}' not found, skipping.\n")
+        continue
+
+    if dam not in FEATURE_CONFIG:
+        print(f"[{dam}] No entry in feature_config.json, skipping.\n")
+        continue
+
+    print(f"{'='*50}")
+    print(f"[{dam}] Training model -> target: {target_col}")
+    print(f"{'='*50}")
+
+    cfg              = FEATURE_CONFIG[dam]
+    prod_cols        = cfg.get("prod_cols", [])
+    weather_stations = cfg.get("weather_stations", [])
+    lag_days         = GUZELHISAR_LAG_DAYS if dam == "Guzelhisar" else DEFAULT_LAG_DAYS
+
+    print(f"  Production       ({len(prod_cols)}): {prod_cols}")
+    print(f"  Weather stations ({len(weather_stations)}): {weather_stations}")
+    print(f"  Lag days         : {lag_days}")
+
+    # -- Build per-dam feature dataframe -------------------------
+    keep = [target_col] + prod_cols
+
+    for station in weather_stations:
+        for prefix in WEATHER_PREFIXES:
+            col = f"{prefix}{station}"
+            if col in df_raw.columns:
+                keep.append(col)
+
+    keep = [c for c in keep if c in df_raw.columns]
+    missing = [c for c in prod_cols if c not in df_raw.columns]
+    if missing:
+        print(f"  [WARNING] Missing columns (skipped): {missing}")
+
+    df = df_raw[keep].copy()
+
+    # -- Feature engineering -------------------------------------
+
+    # Precipitation rolling sums
+    for station in weather_stations:
+        prcp_col = f"prcp_{station}"
+        if prcp_col in df.columns:
+            df[f"rain_7d_{station}"]  = df[prcp_col].rolling(7).sum()
+            df[f"rain_30d_{station}"] = df[prcp_col].rolling(30).sum()
+            df[f"rain_90d_{station}"] = df[prcp_col].rolling(90).sum()
+
+    # Temperature 7-day rolling mean
+    for station in weather_stations:
+        tavg_col = f"tavg_{station}"
+        if tavg_col in df.columns:
+            df[f"temp_7d_{station}"] = df[tavg_col].rolling(7).mean()
+
+    # Lag features
+    for lag in lag_days:
+        df[f"lag_{lag}"] = df[target_col].shift(lag)
+
+    # Trend features — delta_30 only when lags extend beyond 30
+    df["delta_1"] = df["lag_1"] - df["lag_1"].shift(1)  # yesterday minus day before
+    df["delta_7"] = df["lag_1"] - df["lag_7"]
+    if max(lag_days) > 30:
+        df["delta_30"] = df["lag_1"] - df["lag_30"]  # how much has level changed over past 30 days
+
+    # Rolling stats
+    df["rolling_mean_30"] = df[target_col].rolling(30).mean().shift(1)
+    df["rolling_std_30"]  = df[target_col].rolling(30).std().shift(1)
+
+    # Rain x level interactions
+    for station in weather_stations:
+        prcp_col = f"prcp_{station}"
+        if prcp_col in df.columns:
+            df[f"rain_x_level_{station}"] = df[prcp_col] * df["lag_1"]
+
+    # Seasonal signals
+    df["month"]       = df.index.month
+    df["day_of_year"] = df.index.dayofyear
+
+    # -- Handle missing data -------------------------------------
+    df = df.ffill().bfill()
+    df = df[df.index >= pd.Timestamp("2009-03-13")]
+    df = df.dropna()
+
+    print(f"  Dataset size after cleaning: {len(df)} rows")
+    print(f"  Date range: {df.index.min().date()} -> {df.index.max().date()}")
+    print(f"  Target range: {df[target_col].min():.1f}% -> {df[target_col].max():.1f}%")
+    print(f"  Total features: {df.shape[1] - 1}")
+
+    # -- Train / test split --------------------------------------
+    train_data = df[df.index.year < TEST_START_YEAR]
+    test_data  = df[df.index.year >= TEST_START_YEAR]
+
+    # Apply per-dam test end date cap if configured
+    test_end_note = None
+    if dam in DAM_TEST_END:
+        cap = pd.Timestamp(DAM_TEST_END[dam])
+        test_data = test_data[test_data.index <= cap]
+        test_end_note = f"Data capped at {cap.strftime('%d %b %Y')} — source unavailable after this date"
+        print(f"  [INFO] Test data capped at {cap.date()} for {dam}")
+
+    if len(test_data) == 0:
+        print(f"  [WARNING] No test data found for {dam}, skipping.\n")
+        continue
+
+    X_train = train_data.drop(columns=[target_col])
+    y_train = train_data[target_col]
+    X_test  = test_data.drop(columns=[target_col])
+    y_test  = test_data[target_col]
+
+    print(f"  Train: {len(train_data)} rows | Test: {len(test_data)} rows")
+    print(f"  Train target range: {y_train.min():.1f}% -> {y_train.max():.1f}%")
+    print(f"  Test target range:  {y_test.min():.1f}% -> {y_test.max():.1f}%")
+
+    # -- Scale ---------------------------------------------------
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    X_test_scaled  = scaler_X.transform(X_test)
+
+    y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1))
+    y_test_scaled  = scaler_y.transform(y_test.values.reshape(-1, 1))
+
+    # -- Build model ---------------------------------------------
+    # Re-seed before every model so results are identical whether a dam runs alone or as part of the full 6-dam suite.
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    tf.random.set_seed(RANDOM_SEED)
+
+    model = Sequential([
+        Input(shape=(X_train_scaled.shape[1],)),
+        Dense(64, activation="relu"),
+        Dense(8, activation="relu"),
+        Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=15,
+        restore_best_weights=True
+    )
+
+    # -- Train ---------------------------------------------------
+    history = model.fit(
+        X_train_scaled, y_train_scaled,
+        validation_split=0.2,
+        epochs=200,
+        batch_size=32,
+        callbacks=[early_stop],
+        verbose=0
+    )
+
+    print(f"  Stopped at epoch {len(history.history['loss'])}")
+
+    # -- Predict -------------------------------------------------
+    y_pred_scaled = model.predict(X_test_scaled, verbose=0)
+    y_pred = scaler_y.inverse_transform(y_pred_scaled).flatten()
+    y_true = y_test.values
+
+    y_pred = np.clip(y_pred, 0, 100)
+
+    # -- Metrics -------------------------------------------------
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+    r2   = r2_score(y_true, y_pred)
+
+    print(f"\n  -- {dam} Results --")
+    print(f"  RMSE:  {rmse:.2f}%")
+    print(f"  MAE:   {mae:.2f}%")
+    print(f"  R2:    {r2:.4f}")
+
+    results_summary.append({
+        "Dam":        dam,
+        "RMSE (%)":   round(rmse, 2),
+        "MAE (%)":    round(mae, 2),
+        "R2":         round(r2, 4),
+        "Train rows": len(train_data),
+        "Test rows":  len(test_data),
+        "Features":   df.shape[1] - 1,
+        "Production": len(prod_cols),
+        "Weather":    len(weather_stations),
+    })
+
+    # -- Plot ----------------------------------------------------
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10),
+                             gridspec_kw={"height_ratios": [3, 1]})
+    fig.suptitle(f"{dam} Dam - Fill % Prediction vs Actual",
+                 fontsize=15, fontweight="bold", y=0.98)
+
+    ax = axes[0]
+    ax.plot(y_test.index, y_true, label="Actual",    color="#1f77b4", linewidth=1.8)
+    ax.plot(y_test.index, y_pred, label="Predicted", color="#ff7f0e",
+            linewidth=1.8, linestyle="--")
+    ax.fill_between(y_test.index, y_true, y_pred,
+                    alpha=0.15, color="gray", label="Error band")
+    ax.set_ylabel("Fill Level (%)", fontsize=11)
+    ax.set_ylim(0, 105)
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=35, ha="right")
+
+    metrics_text = f"RMSE: {rmse:.2f}%   MAE: {mae:.2f}%   R2: {r2:.4f}"
+    ax.text(0.01, 0.04, metrics_text, transform=ax.transAxes,
+            fontsize=9, color="dimgray",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+    if test_end_note:
+        ax.text(0.01, 0.11, f"⚠ {test_end_note}", transform=ax.transAxes,
+                fontsize=8.5, color="#8B4513",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff3cd", alpha=0.9))
+
+    ax2 = axes[1]
+    residuals = y_true - y_pred
+    ax2.bar(y_test.index, residuals,
+            color=["#d62728" if r < 0 else "#2ca02c" for r in residuals],
+            width=1.0, alpha=0.7)
+    ax2.axhline(0, color="black", linewidth=0.8)
+    ax2.set_ylabel("Residual (%)", fontsize=10)
+    ax2.set_xlabel("Date", fontsize=11)
+    ax2.grid(True, alpha=0.3)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+    ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=35, ha="right")
+
+    plt.tight_layout()
+    out_path = f"{OUT_DIR}/{dam}_prediction.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+# =========================
+# SUMMARY TABLE
+# =========================
+
+print("\n" + "="*60)
+print("SUMMARY - ALL DAMS")
+print("="*60)
+summary_df = pd.DataFrame(results_summary)
+print(summary_df.to_string(index=False))
+summary_csv = f"{OUT_DIR}/dam_results_summary.csv"
+summary_df.to_csv(summary_csv, index=False)
+print(f"\nSummary saved to {summary_csv}")

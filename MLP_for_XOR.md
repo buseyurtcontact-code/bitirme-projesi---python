@@ -59,6 +59,16 @@ Eğitim tamamlandıktan sonra XOR doğruluk tablosunu test et:
 Özet: XOR problemi doğrusal ayrılabilir değildir, bu yüzden tek katmanlı perceptron öğrenemez. 
 Çok katmanlı algılayıcı, gizli katman sayesinde doğrusal olmayan karar sınırları oluşturur ve XOR’u başarıyla öğrenir.
 
+
+Açıklama
+Bu diyagramda her kutunun yanındaki yorum satırları (%%) sana adımın ne işe yaradığını anlatıyor.
+
+GitHub README dosyana bu kodu koyarsan, Mermaid desteği olan ortamlarda akış diyagramı olarak görünecek.
+
+Akış: Başlat → İleri Yayılım → Hata → Geri Yayılım → Güncelleme → Kontrol → Yakınsama → Değerlendirme şeklinde ilerliyor.
+
+
+
 ```mermaid
 flowchart TD
 

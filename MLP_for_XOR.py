@@ -1,3 +1,18 @@
+'''
+
+XOR problemi 
+
+x1	x2	çıktı
+0	0	0
+0	1	1
+1	0	1
+1	1	0
+
+x1 ve x2 verdiğimizde çıktıyı öğretmeye çalışıyoruz
+
+'''
+
+
 import math
 import random
 

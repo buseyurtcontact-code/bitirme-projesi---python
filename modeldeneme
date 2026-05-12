@@ -1,0 +1,548 @@
+import argparse                         # Komut satırı argümanlarını işlemek için
+import json                             # JSON dosyalarını okumak/yazmak için
+import math                             # Matematiksel fonksiyonlar (log, exp vb.) için
+import os                               # Dosya/klasör işlemleri için
+import random                           # Rastgele sayı üretimi için
+import time                             # Süre ölçümü için
+from itertools import product           # Kartezyen çarpım (kombinasyon) üretmek için
+
+import matplotlib                       # Grafik kütüphanesi ana modülü
+matplotlib.use("Agg")                   # Ekransız (sunucu) ortamda çalışmak için Agg arka ucunu seç
+import numpy as np                      # Sayısal dizi işlemleri için
+import pandas as pd                     # Tablo/zaman serisi verisi için
+import tensorflow as tf                 # Derin öğrenme framework'ü
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score  # Regresyon metrikleri
+from sklearn.preprocessing import MinMaxScaler                                 # 0-1 normalizasyonu için
+from tensorflow.keras.callbacks import EarlyStopping                           # Erken durdurma callback'i
+from tensorflow.keras.layers import Dense, Flatten, Input                      # Temel katman tipleri
+from tensorflow.keras.models import Sequential                                 # Sıralı model yapısı
+
+
+# =========================
+# ARGUMENT PARSING
+# =========================
+
+parser = argparse.ArgumentParser(description="Hyperparameter search for dam fill level prediction.")  # Argüman ayrıştırıcı nesnesi oluştur
+
+parser.add_argument("--dams", type=str, default=None,
+    help='Comma-separated list of dams. Default: all. Example: --dams "Urkmez,Tahtali"')  # Hangi barajların çalıştırılacağını belirt
+
+parser.add_argument("--models", type=str, default="GRU",
+    help='Comma-separated list of model types. Default: GRU. Example: --models "GRU,LSTM,Dense"')  # Hangi model tiplerinin kullanılacağını belirt
+
+args = parser.parse_args()  # Komut satırı argümanlarını ayrıştır ve args nesnesine ata
+
+# =========================
+# SEARCH GRID
+# =========================
+
+# --- Lag configs ---
+# Config A: current baseline (conservative, longer lags)
+LAG_CONFIG_A = {              # Gecikmeli özellik yapılandırması A: tutucu, uzun gecikmeler
+    7:  [7,  14, 30, 60,  90],    # 7 günlük horizon için kullanılacak gecikme (lag) günleri
+    14: [7,  14, 21, 30,  60],    # 14 günlük horizon için gecikme günleri
+    30: [14, 30, 60, 90, 180],    # 30 günlük horizon için gecikme günleri
+}
+
+# Config B: your proposed config (finer short-term for 7d)
+LAG_CONFIG_B = {              # Gecikmeli özellik yapılandırması B: 7 günlük horizon için daha ince kısa vadeli gecikmeler
+    7:  [5,  10, 20, 40,  60],    # 7 günlük horizon için önerilen yeni gecikme günleri
+    14: [7,  14, 30, 60,  90],    # 14 günlük horizon için gecikme günleri
+    30: [14, 30, 60, 90, 180],    # 30 günlük horizon için gecikme günleri
+}
+
+# Config C: denser short-term across all horizons
+LAG_CONFIG_C = {              # Gecikmeli özellik yapılandırması C: tüm horizonlarda yoğun kısa vadeli gecikmeler
+    7:  [3,  7,  14, 30,  60],    # 7 günlük horizon için yoğun kısa vadeli gecikme günleri
+    14: [5,  10, 21, 45,  90],    # 14 günlük horizon için gecikme günleri
+    30: [7,  21, 45, 90, 180],    # 30 günlük horizon için gecikme günleri
+}
+
+LAG_CONFIGS = {                         # Tüm lag yapılandırmalarını isimle eşleştiren sözlük
+    "A_conservative": LAG_CONFIG_A,     # A yapılandırması: tutucu
+    "B_finer_7d":     LAG_CONFIG_B,     # B yapılandırması: 7 günlük için daha ince
+    "C_dense_short":  LAG_CONFIG_C,     # C yapılandırması: yoğun kısa vadeli
+}
+
+# --- Sequence length combos (7d / 14d / 30d horizon) ---
+SEQ_LEN_CONFIGS = {                              # Farklı horizon'lar için sekans uzunluğu yapılandırmaları
+    "seq_30_60_90":   {7: 30,  14: 60,  30: 90},  # 7d→30, 14d→60, 30d→90 zaman adımı
+    "seq_45_90_120":  {7: 45,  14: 90,  30: 120}, # 7d→45, 14d→90, 30d→120 zaman adımı
+    "seq_20_40_60":   {7: 20,  14: 40,  30: 60},  # 7d→20, 14d→40, 30d→60 zaman adımı
+}
+
+# --- Sample weight halflives (days) ---
+HALFLIVES = [180, 365, 730]  # Örnek ağırlığı için kullanılacak yarı ömür değerleri (gün): 6 ay, 1 yıl, 2 yıl
+
+# --- Strategies ---
+STRATEGIES_TO_RUN = ["baseline", "walkfwd_expanding"]  # Çalıştırılacak eğitim stratejileri
+
+# =========================
+# FIXED CONFIG
+# =========================
+
+RANDOM_SEED = 1                     # Tekrar üretilebilirlik için sabit rastgele tohum
+random.seed(RANDOM_SEED)            # Python random modülü tohumunu sabitle
+np.random.seed(RANDOM_SEED)         # NumPy rastgele sayı üreteci tohumunu sabitle
+tf.random.set_seed(RANDOM_SEED)     # TensorFlow rastgele sayı üreteci tohumunu sabitle
+
+ALL_DAMS = ["Guzelhisar", "Balcova", "Gordes", "Tahtali", "Urkmez", "AlacatiKutluAktas"]  # Desteklenen tüm barajların listesi
+ALL_MODELS = ["Dense", "GRU", "LSTM"]  # Desteklenen tüm model tiplerinin listesi
+TARGET_HORIZONS = [7, 14, 30]          # Tahmin horizonları (gün cinsinden)
+
+WEATHER_PREFIXES = ["tmax_", "tmin_", "tavg_", "hum_", "wind_", "sun_", "evap_", "prcp_"]  # Ham veri sütunlarındaki hava durumu ön ekleri
+FEATURE_CONFIG_PATH = "feature_config.json"  # Baraj başına özellik yapılandırmasının yolu
+
+# Resolve dams
+if args.dams:                                                               # Komut satırından baraj argümanı verilmişse
+    requested = [d.strip() for d in args.dams.split(",")]                   # Virgülle ayrılmış listeyi böl ve boşlukları temizle
+    DAMS = [d for d in requested if d in ALL_DAMS]                          # Sadece geçerli baraj adlarını filtrele
+    if not DAMS:                                                            # Geçerli baraj kalmadıysa
+        print("[ERROR] No valid dams specified. Exiting.")                  # Hata mesajı yazdır
+        exit(1)                                                             # Programı hata koduyla sonlandır
+else:                                                                       # Argüman verilmemişse
+    DAMS = ALL_DAMS                                                         # Tüm barajları kullan
+
+# Resolve models
+requested_models = [m.strip() for m in args.models.split(",")]              # Komut satırından model listesini böl ve temizle
+MODEL_TYPES = [m for m in requested_models if m in ALL_MODELS]              # Sadece geçerli model tiplerini filtrele
+if not MODEL_TYPES:                                                         # Geçerli model tipi kalmadıysa
+    print("[ERROR] No valid model types specified. Exiting.")               # Hata mesajı yazdır
+    exit(1)                                                                 # Programı hata koduyla sonlandır
+
+OUT_DIR = "results_search"          # Çıktı dosyalarının kaydedileceği klasör adı
+os.makedirs(OUT_DIR, exist_ok=True) # Klasör yoksa oluştur, varsa hata verme
+
+# =========================
+# CHECKPOINT — resume support
+# =========================
+CHECKPOINT_CSV = f"{OUT_DIR}/search_results_intermediate.csv"  # Ara sonuçların kaydedileceği CSV dosyasının yolu
+
+def combo_key(row):  # Bir sonuç satırından benzersiz kombinasyon anahtarı oluşturan fonksiyon
+    return (str(row["Dam"]), str(row["Strategy"]), str(row["Model"]),
+            str(row["LagConfig"]), str(row["SeqConfig"]),
+            int(row["Halflife"]), int(row["HiddenSize"]))  # Baraj, strateji, model, lag, seq, halflife ve hidden size'dan tuple oluştur
+
+results_all = []        # Tüm sonuçları tutacak liste
+done_combos = set()     # Tamamlanan kombinasyonları tutacak küme (hızlı arama için)
+
+if os.path.exists(CHECKPOINT_CSV):                               # Ara kayıt dosyası mevcutsa
+    df_existing = pd.read_csv(CHECKPOINT_CSV)                    # Mevcut sonuçları oku
+    results_all = df_existing.to_dict("records")                 # DataFrame'i sözlük listesine çevir
+    done_combos = {combo_key(r) for r in results_all}            # Tamamlanan kombinasyonları kümeye ekle
+    print(f"[RESUME] Loaded {len(results_all)} completed combos from checkpoint.\n")  # Kaç kombinasyon yüklendiğini yazdır
+
+# Count total runs upfront so we can show progress
+total_runs = (              # Toplam çalıştırma sayısını hesapla (tüm kombinasyonlar)
+    len(LAG_CONFIGS) *      # Lag yapılandırma sayısı
+    len(SEQ_LEN_CONFIGS) *  # Sekans uzunluğu yapılandırma sayısı
+    len(HALFLIVES) *        # Yarı ömür değeri sayısı
+    len(STRATEGIES_TO_RUN) * # Strateji sayısı
+    len(MODEL_TYPES) *      # Model tipi sayısı
+    len(DAMS) *             # Baraj sayısı
+    len(TARGET_HORIZONS)    # Tahmin horizon sayısı
+)
+
+print("=" * 70)                                 # Ayırıcı çizgi yazdır
+print("HYPERPARAMETER SEARCH")                  # Başlık yazdır
+print("=" * 70)                                 # Ayırıcı çizgi yazdır
+print(f"Dams        : {DAMS}")                  # Kullanılacak barajları yazdır
+print(f"Models      : {MODEL_TYPES}")           # Kullanılacak model tiplerini yazdır
+print(f"Lag configs : {list(LAG_CONFIGS.keys())}")       # Lag yapılandırma adlarını yazdır
+print(f"Seq configs : {list(SEQ_LEN_CONFIGS.keys())}")   # Sekans yapılandırma adlarını yazdır
+print(f"Halflives   : {HALFLIVES}")             # Yarı ömür değerlerini yazdır
+print(f"Strategies  : {STRATEGIES_TO_RUN}")     # Stratejileri yazdır
+print(f"Total model fits: {total_runs}")         # Toplam model eğitim sayısını yazdır
+print(f"Estimated time  : {total_runs * 12 / 3600:.1f}h – {total_runs * 18 / 3600:.1f}h")  # Tahmini süreyi saat cinsinden yazdır
+print("=" * 70 + "\n")                          # Kapanış çizgisi ve boş satır
+
+# =========================
+# HELPERS
+# =========================
+
+def make_sample_weights(index, halflife_days=365):              # Zaman serisindeki örneklere üstel azalan ağırlık atayan fonksiyon
+    latest   = index.max()                                      # En son tarihi bul
+    days_ago = np.array((latest - index).days, dtype=float)    # Her örneğin en son tarihten kaç gün önce olduğunu hesapla
+    weights  = np.exp(-days_ago * math.log(2) / halflife_days) # Üstel azalan ağırlık formülünü uygula
+    return weights / weights.mean()                             # Ağırlıkları ortalamaları 1 olacak şekilde normalize et
+
+def make_sequences(X, seq_len):                                 # Kayan pencere yöntemiyle 3 boyutlu sekans dizisi oluşturan fonksiyon
+    """Vectorised sliding window using numpy strides — no Python loop."""
+    if seq_len <= 1:                                            # Sekans uzunluğu 1 veya daha azsa
+        return X[:, np.newaxis, :]                              # Her satırı tek adımlı sekans olarak döndür
+    n, n_feat = X.shape                                         # Satır sayısı ve özellik sayısını al
+    shape   = (n - seq_len + 1, seq_len, n_feat)               # Çıktı dizisinin şeklini hesapla
+    strides = (X.strides[0], X.strides[0], X.strides[1])      # Bellek adım bilgilerini kayan pencere için ayarla
+    return np.lib.stride_tricks.as_strided(X, shape=shape, strides=strides).copy()  # Kopyalanan stride tabanlı görünümü döndür
+
+def build_and_train(model_type, X_tr, y_tr, X_te, seq_len, sample_weight=None):  # Model oluşturup eğiten ve test tahminini döndüren fonksiyon
+    from tensorflow.keras.layers import GRU, LSTM              # GRU ve LSTM katmanlarını içe aktar
+
+    random.seed(RANDOM_SEED)            # Tekrar üretilebilirlik için random tohumunu sıfırla
+    np.random.seed(RANDOM_SEED)         # NumPy tohumunu sıfırla
+    tf.random.set_seed(RANDOM_SEED)     # TensorFlow tohumunu sıfırla
+
+    n_feat = X_tr.shape[-1]             # Özellik sayısını girdi verisinin son boyutundan al
+
+    if model_type == "Dense":           # Seçilen model tipi Dense (tam bağlı) ise
+        m = Sequential([
+            Input(shape=(seq_len, n_feat)),             # Girdi katmanı: (sekans_uzunluğu, özellik_sayısı)
+            Flatten(),                                   # 2D sekansı 1D vektöre düzleştir
+            Dense(64, activation="relu"),               # 64 nöronlu gizli katman, ReLU aktivasyonu
+            Dense(max(8, 64 // 8), activation="relu"),  # Daralan ikinci gizli katman
+            Dense(1)                                     # Tek nöronlu çıktı katmanı (regresyon)
+        ])
+    elif model_type == "GRU":           # Seçilen model tipi GRU ise
+        m = Sequential([
+            Input(shape=(seq_len, n_feat)),             # Girdi katmanı
+            GRU(64, return_sequences=False),            # 64 birimli GRU katmanı, sadece son adımı döndür
+            Dense(max(8, 64 // 8), activation="relu"),  # Tam bağlı gizli katman
+            Dense(1)                                     # Çıktı katmanı
+        ])
+    elif model_type == "LSTM":          # Seçilen model tipi LSTM ise
+        m = Sequential([
+            Input(shape=(seq_len, n_feat)),             # Girdi katmanı
+            LSTM(64, return_sequences=False),           # 64 birimli LSTM katmanı, sadece son adımı döndür
+            Dense(max(8, 64 // 8), activation="relu"),  # Tam bağlı gizli katman
+            Dense(1)                                     # Çıktı katmanı
+        ])
+
+    m.compile(optimizer="adam", loss="mse")                                             # Modeli Adam optimizer ve MSE kaybı ile derle
+    es = EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True)       # Doğrulama kaybı 8 epoch iyileşmezse dur, en iyi ağırlıkları geri yükle
+
+    Xtr, Xte = X_tr, X_te              # Eğitim ve test verisine kısayol değişkenleri ata
+    if sample_weight is not None:       # Örnek ağırlığı verilmişse
+        val_cut = int(len(Xtr) * 0.8)  # %80 eğitim, %20 doğrulama bölümü belirle
+        sw_t    = sample_weight[:val_cut]  # Sadece eğitim kısmına ait ağırlıkları al
+        m.fit(Xtr[:val_cut], y_tr[:val_cut],
+              sample_weight=sw_t,
+              validation_data=(Xtr[val_cut:], y_tr[val_cut:]),
+              epochs=100, batch_size=32, callbacks=[es], verbose=0)  # Modeli ağırlıklı örneklerle eğit
+    else:                               # Örnek ağırlığı verilmemişse
+        m.fit(Xtr, y_tr, validation_split=0.2,
+              epochs=100, batch_size=32, callbacks=[es], verbose=0)  # Modeli standart doğrulama bölünmesiyle eğit
+
+    return m.predict(Xte, verbose=0)    # Test verisi üzerinde tahmin yap ve döndür
+
+def make_dynamic_wf_windows(full_df, start_date, months_step):  # Kayan ileri doğrulama (walk-forward) pencereleri oluşturan fonksiyon
+    windows = []                                                  # Pencereleri tutacak boş liste
+    current_test_start = pd.Timestamp(start_date)                # İlk test penceresi başlangıç tarihi
+    max_date = full_df.index.max()                               # Veri setinin en son tarihi
+    while current_test_start < max_date:                         # Test penceresi veri sonuna ulaşana kadar döngü
+        current_test_end = current_test_start + pd.DateOffset(months=months_step)  # Test penceresi bitiş tarihi
+        train_slice = full_df[full_df.index < current_test_start]                  # Test başlangıcından önceki tüm veri eğitim
+        test_slice  = full_df[(full_df.index >= current_test_start) &
+                               (full_df.index < current_test_end)]                 # Mevcut test penceresi
+        if len(test_slice) > 0 and len(train_slice) > 60:                          # Yeterli veri varsa
+            windows.append((train_slice, test_slice))                               # Pencereyi listeye ekle
+        current_test_start = current_test_end                                       # Sonraki pencereye geç
+    return windows                                                                  # Tüm pencereleri döndür
+
+# =========================
+# LOAD DATA
+# =========================
+
+with open(FEATURE_CONFIG_PATH, "r") as f:   # Özellik yapılandırma dosyasını aç
+    FEATURE_CONFIG = json.load(f)            # JSON içeriğini sözlük olarak oku
+
+df_raw = pd.read_csv("son_merged.csv")                          # Ana birleşik veri setini CSV'den oku
+df_raw["date"] = pd.to_datetime(df_raw["Date"], dayfirst=True)  # "Date" sütununu datetime tipine çevir (gün önce)
+df_raw = df_raw.sort_values("date").set_index("date")           # Tarihe göre sırala ve indeks yap
+df_raw = df_raw.drop(columns=["Date"], errors="ignore")         # Artık gereksiz olan "Date" sütununu kaldır
+df_raw = df_raw.dropna(axis=1, how="all")                       # Tamamı NaN olan sütunları kaldır
+
+prcp_all = [c for c in df_raw.columns if c.startswith("prcp_")]  # Yağış (precipitation) sütunlarını seç
+evap_all = [c for c in df_raw.columns if c.startswith("evap_")]  # Buharlaşma (evaporation) sütunlarını seç
+df_raw[prcp_all] = df_raw[prcp_all].fillna(0)                    # Yağış NaN'larını 0 ile doldur (yağmadı)
+df_raw[evap_all] = df_raw[evap_all].fillna(0)                    # Buharlaşma NaN'larını 0 ile doldur
+
+doluluk_cols = [c for c in df_raw.columns if "DolulukOrani" in c]   # Doluluk oranı sütunlarını seç
+for col in doluluk_cols:                                              # Her doluluk oranı sütunu için
+    df_raw.loc[df_raw[col] > 100, col] = np.nan                      # %100'ü aşan değerleri NaN yap (geçersiz ölçüm)
+df_raw[doluluk_cols] = df_raw[doluluk_cols].interpolate(method="time")  # Zaman tabanlı lineer interpolasyon ile NaN'ları doldur
+
+print(f"Data loaded: {len(df_raw)} rows, {df_raw.index.min().date()} -> {df_raw.index.max().date()}\n")  # Yüklenen veri özeti
+
+# =========================
+# MAIN SEARCH LOOP
+# =========================
+
+run_counter = len(done_combos)  # Çalıştırma sayacını tamamlanan kombinasyon sayısından başlat
+start_time  = time.time()       # Toplam süreyi ölçmek için başlangıç zamanını kaydet
+
+for lag_name, lag_cfg in LAG_CONFIGS.items():       # Her lag yapılandırması üzerinde döngü
+    for seq_name, seq_cfg in SEQ_LEN_CONFIGS.items():   # Her sekans uzunluğu yapılandırması üzerinde döngü
+
+        # --- Build all unique lag days needed for this lag config ---
+        all_unique_lags = sorted(set(l for h_lags in lag_cfg.values() for l in h_lags))  # Bu lag konfigürasyonu için gereken tüm benzersiz lag günlerini hesapla
+        lag_cols_all    = [f"lag_{l}" for l in all_unique_lags]                           # Tüm lag sütun adlarını oluştur
+
+        for dam in DAMS:                                            # Her baraj üzerinde döngü
+            target_col = f"{dam}DolulukOrani"                      # Bu barajın hedef sütun adı
+            cfg              = FEATURE_CONFIG[dam]                 # Bu barajın özellik yapılandırmasını al
+            prod_cols        = cfg.get("prod_cols", [])            # Üretim/su alma sütunlarını al
+            weather_stations = cfg.get("weather_stations", [])     # Bu barajla ilişkili hava istasyonlarını al
+
+            # Build feature dataframe for this dam
+            keep = [target_col] + prod_cols                         # Temel sütunlar: hedef + üretim
+            for station in weather_stations:                        # Her hava istasyonu için
+                for prefix in WEATHER_PREFIXES:                     # Her hava durumu ön eki için
+                    col = f"{prefix}{station}"                      # Tam sütun adını oluştur
+                    if col in df_raw.columns:                       # Sütun veri setinde mevcutsa
+                        keep.append(col)                            # Tutulacak sütunlar listesine ekle
+            keep = [c for c in keep if c in df_raw.columns]        # Sadece gerçekten mevcut sütunları tut
+
+            df = df_raw[keep].copy()                                # Seçilen sütunları kopyalayarak yeni DataFrame oluştur
+
+            # Rolling weather features
+            for station in weather_stations:                         # Her hava istasyonu için kayan pencere özellikleri oluştur
+                prcp_col = f"prcp_{station}"                         # İstasyonun yağış sütun adı
+                if prcp_col in df.columns:                           # Yağış sütunu mevcutsa
+                    df[f"rain_7d_{station}"]  = df[prcp_col].rolling(7).sum()   # Son 7 günlük kümülatif yağış
+                    df[f"rain_30d_{station}"] = df[prcp_col].rolling(30).sum()  # Son 30 günlük kümülatif yağış
+                    df[f"rain_90d_{station}"] = df[prcp_col].rolling(90).sum()  # Son 90 günlük kümülatif yağış
+                tavg_col = f"tavg_{station}"                         # İstasyonun ortalama sıcaklık sütun adı
+                if tavg_col in df.columns:                           # Ortalama sıcaklık sütunu mevcutsa
+                    df[f"temp_7d_{station}"] = df[tavg_col].rolling(7).mean()   # Son 7 günlük ortalama sıcaklık
+
+            # Lag features (all unique lags for this config)
+            for lag in all_unique_lags:                             # Bu yapılandırma için her benzersiz gecikme günü
+                df[f"lag_{lag}"] = df[target_col].shift(lag)       # Hedef değişkenin lag gün öncesini özellik olarak ekle
+
+            base_lag = min(all_unique_lags)                         # En küçük lag değerini temel lag olarak belirle
+
+            # Trend features
+            df["delta_1"] = df[f"lag_{base_lag}"] - df[f"lag_{base_lag}"].shift(1)  # 1 günlük değişim trendi
+            if 7 in all_unique_lags:                                                  # 7 günlük lag mevcutsa
+                df["delta_7"] = df[f"lag_{base_lag}"] - df["lag_7"]                 # 7 günlük değişim trendi
+            if 30 in all_unique_lags and max(all_unique_lags) > 30:                  # 30 günlük lag mevcutsa ve maksimum lag 30'dan büyükse
+                df["delta_30"] = df[f"lag_{base_lag}"] - df["lag_30"]               # 30 günlük değişim trendi
+
+            # Rolling stats
+            df["rolling_mean_30"]  = df[target_col].rolling(30).mean().shift(1)    # Son 30 günlük kayan ortalama (sızdırmaz)
+            df["rolling_std_30"]   = df[target_col].rolling(30).std().shift(1)     # Son 30 günlük kayan standart sapma
+            df["rolling_mean_180"] = df[target_col].rolling(180).mean().shift(1)   # Son 180 günlük kayan ortalama
+            df["rolling_mean_365"] = df[target_col].rolling(365).mean().shift(1)   # Son 365 günlük kayan ortalama
+            df["trend_direction"]  = df["rolling_mean_180"] - df["rolling_mean_365"]  # 180 ve 365 günlük ortalama farkı (uzun vadeli trend yönü)
+
+            # Interaction features
+            for station in weather_stations:                            # Her hava istasyonu için etkileşim özelliği oluştur
+                prcp_col = f"prcp_{station}"                            # Yağış sütun adı
+                if prcp_col in df.columns:                              # Yağış sütunu mevcutsa
+                    df[f"rain_x_level_{station}"] = df[prcp_col] * df[f"lag_{base_lag}"]  # Yağış × doluluk etkileşim terimi
+
+            # Seasonal
+            df["month_sin"] = np.sin(2 * np.pi * df.index.month / 12)        # Ay bilgisini sinüs ile döngüsel kodla
+            df["month_cos"] = np.cos(2 * np.pi * df.index.month / 12)        # Ay bilgisini kosinüs ile döngüsel kodla
+            df["doy_sin"]   = np.sin(2 * np.pi * df.index.dayofyear / 365)   # Yılın günü bilgisini sinüs ile kodla
+            df["doy_cos"]   = np.cos(2 * np.pi * df.index.dayofyear / 365)   # Yılın günü bilgisini kosinüs ile kodla
+
+            # Multi-horizon targets
+            target_cols_multi = [f"target_{h}" for h in TARGET_HORIZONS]  # Her horizon için hedef sütun adları listesi
+            for h in TARGET_HORIZONS:                                       # Her tahmin horizonu için
+                df[f"target_{h}"] = df[target_col].shift(-h)               # h gün sonrasını hedef olarak ekle (gelecek kaydırma)
+
+            df = df.ffill().bfill().dropna()  # Kalan NaN'ları önce ileri sonra geri doldur, ardından NaN içeren satırları at
+
+            dam_start = df_raw[target_col].first_valid_index()  # Bu barajın verisinin başladığı ilk geçerli tarihi bul
+            if dam_start is None:                                # Baraj için hiç veri yoksa
+                continue                                         # Bu barajı atla
+            DAM_END_DATES = {"Guzelhisar": pd.Timestamp("2025-11-19")}  # Bazı barajlar için özel bitiş tarihleri
+            dam_end = DAM_END_DATES.get(dam, pd.Timestamp("2025-11-30"))  # Barajın bitiş tarihini al, varsayılan 2025-11-30
+            df = df[(df.index >= pd.Timestamp(dam_start)) & (df.index <= dam_end)]  # Geçerli tarih aralığına kırp
+
+            pre2023   = df[df.index.year < 2023]       # 2023 öncesi veriyi eğitim seti olarak ayır
+            test_data = df[df.index.year >= 2023]      # 2023 ve sonrası veriyi test seti olarak ayır
+            if len(test_data) == 0:                    # Test verisi yoksa
+                continue                               # Bu barajı atla
+
+            drop_from_X = [target_col] + target_cols_multi  # Girdi özelliklerinden çıkarılacak hedef sütunlar
+            y_test      = test_data[target_cols_multi]       # Test setinin hedef değerleri
+
+            STRATEGIES = [                                                                       # Strateji tanımları: ad ve eğitim kaynağı
+                ("baseline",          pre2023,                                            ),     # Temel strateji: sadece 2023 öncesi veri
+                ("walkfwd_expanding", make_dynamic_wf_windows(df, "2023-01-01", 6)),            # Genişleyen walk-forward: 6 aylık pencereler
+            ]
+
+        for halflife in HALFLIVES:                           # Her yarı ömür değeri için döngü
+                for strategy_label, train_source in STRATEGIES:  # Her strateji için döngü
+                    if strategy_label not in STRATEGIES_TO_RUN:  # Bu strateji çalıştırılacaklar listesinde değilse
+                        continue                                  # Atla
+                    is_walkfwd = strategy_label.startswith("walkfwd")  # Walk-forward stratejisi mi kontrol et
+
+                    for model_type in MODEL_TYPES:                      # Her model tipi için döngü
+                        # Skip if this combo is already done (checkpoint resume)
+                        ck = (dam, strategy_label, model_type,
+                                lag_name, seq_name, halflife, 64)       # Bu kombinasyon için benzersiz anahtar oluştur
+                        if ck in done_combos:                           # Bu kombinasyon daha önce tamamlandıysa
+                            run_counter += len(TARGET_HORIZONS)         # Sayacı horizon sayısı kadar artır
+                            print(f"  [SKIP] {dam} {strategy_label} {model_type} "
+                                    f"lag={lag_name} seq={seq_name} hl={halflife} hid={64}")  # Atlanan kombinasyonu yazdır
+                            continue                                    # Sonraki kombinasyona geç
+
+                        horizon_metrics = {}    # Bu kombinasyonun horizon bazındaki metriklerini tutacak sözlük
+
+                        for h in TARGET_HORIZONS:                           # Her tahmin horizonu için döngü
+                            run_counter += 1                                # Çalıştırma sayacını artır
+                            h_lags        = lag_cfg[h]                     # Bu horizon için kullanılacak lag günleri
+                            seq_len       = seq_cfg[h]                     # Bu horizon için sekans uzunluğu
+                            target_col_h  = f"target_{h}"                  # Bu horizonun hedef sütun adı
+                            label         = f"+{h}d"                       # Horizon etiketi (örn. "+7d")
+
+                            lag_cols_h    = [f"lag_{l}" for l in h_lags]  # Bu horizon için kullanılacak lag sütunları
+                            lag_cols_drop = [c for c in lag_cols_all if c not in lag_cols_h]  # Bu horizon için kullanılmayacak lag sütunları
+                            drop_h        = drop_from_X + lag_cols_drop    # Bu horizonda girdi verisinden çıkarılacak tüm sütunlar
+
+                            X_test_h = test_data.drop(
+                                columns=[c for c in drop_h if c in test_data.columns])  # Test verisinden gereksiz sütunları çıkar
+
+                            elapsed  = time.time() - start_time                              # Geçen süreyi hesapla
+                            eta_secs = (elapsed / run_counter) * (total_runs - run_counter) if run_counter > 1 else 0  # Kalan tahmini süreyi hesapla
+                            print(f"  [{run_counter}/{total_runs}] "
+                                    f"lag={lag_name} seq={seq_name} hl={halflife} "
+                                    f"hid={64} {strategy_label} {model_type} "
+                                    f"{dam} {label}  "
+                                    f"ETA {eta_secs/3600:.1f}h", end="  ", flush=True)  # İlerleme bilgisini yazdır
+
+                            if is_walkfwd:                                                   # Walk-forward strateji ise
+                                all_y_true_h, all_y_pred_h = [], []                         # Gerçek ve tahmin değerleri için boş listeler
+                                for train_slice, test_slice in train_source:                 # Her walk-forward penceresi için
+                                    X_tr_h = train_slice.drop(columns=[c for c in drop_h if c in train_slice.columns])  # Eğitim özellik matrisi
+                                    y_tr_h = train_slice[[target_col_h]]                    # Eğitim hedef vektörü
+                                    X_te_h = test_slice.drop(columns=[c for c in drop_h if c in test_slice.columns])   # Test özellik matrisi
+                                    y_te_h = test_slice[[target_col_h]]                     # Test hedef vektörü
+
+                                    scaler_x = MinMaxScaler()   # Özellikler için normalleştirici oluştur
+                                    scaler_y = MinMaxScaler()   # Hedef için normalleştirici oluştur
+                                    X_tr_sc  = scaler_x.fit_transform(X_tr_h)   # Eğitim özelliklerini normalleştir ve fit et
+                                    y_tr_sc  = scaler_y.fit_transform(y_tr_h.values)  # Eğitim hedefini normalleştir ve fit et
+                                    X_te_sc  = scaler_x.transform(X_te_h)       # Test özelliklerini eğitim scaler ile normalleştir
+
+                                    X_tr_seq = make_sequences(X_tr_sc, seq_len)  # Eğitim verisi için sekanslar oluştur
+                                    X_te_seq = make_sequences(X_te_sc, seq_len)  # Test verisi için sekanslar oluştur
+                                    y_tr_seq = y_tr_sc[seq_len - 1:]             # Sekans oluşturmanın kaybettiği başlangıç satırlarını at
+
+                                    sw = make_sample_weights(
+                                        train_slice.index[seq_len - 1:],
+                                        halflife_days=halflife)                  # Eğitim örnekleri için zamana dayalı ağırlıkları hesapla
+
+                                    pred_sc = build_and_train(
+                                        model_type, X_tr_seq, y_tr_seq, X_te_seq,
+                                        seq_len=seq_len,
+                                        sample_weight=sw)                        # Modeli eğit ve normalize tahmin al
+                                    pred_us = scaler_y.inverse_transform(pred_sc)  # Tahmini orijinal ölçeğe geri dönüştür
+
+                                    all_y_true_h.append(y_te_h.values[seq_len - 1:])  # Bu pencerenin gerçek değerlerini ekle
+                                    all_y_pred_h.append(pred_us)                       # Bu pencerenin tahmin değerlerini ekle
+
+                                y_true_h = np.vstack(all_y_true_h).ravel()  # Tüm pencerelerin gerçek değerlerini tek diziye birleştir
+                                y_pred_h = np.vstack(all_y_pred_h).ravel()  # Tüm pencerelerin tahminlerini tek diziye birleştir
+
+                            else:                                                                    # Temel (baseline) strateji ise
+                                if len(pre2023) < seq_len + 10:                                     # Eğitim verisi yetersizse
+                                    print(f"skip (too few rows)")                                   # Uyarı yazdır
+                                    continue                                                         # Bu kombinasyonu atla
+                                X_tr_h = pre2023.drop(columns=[c for c in drop_h if c in pre2023.columns])  # 2023 öncesi eğitim özellik matrisi
+                                y_tr_h = pre2023[[target_col_h]]                                    # 2023 öncesi eğitim hedef vektörü
+
+                                sc_X = MinMaxScaler()               # Özellikler için normalleştirici
+                                sc_y = MinMaxScaler()               # Hedef için normalleştirici
+                                X_tr_sc = sc_X.fit_transform(X_tr_h)  # Eğitim özelliklerini normalleştir
+                                y_tr_sc = sc_y.fit_transform(y_tr_h.values)  # Eğitim hedefini normalleştir
+                                X_te_sc = sc_X.transform(X_test_h)  # Test özelliklerini normalleştir
+
+                                X_tr_seq = make_sequences(X_tr_sc, seq_len)  # Eğitim sekansları
+                                X_te_seq = make_sequences(X_te_sc, seq_len)  # Test sekansları
+                                y_tr_seq = y_tr_sc[seq_len - 1:]             # Hedef dizisini sekans kaybına göre hizala
+
+                                pred_sc  = build_and_train(
+                                    model_type, X_tr_seq, y_tr_seq, X_te_seq,
+                                    seq_len=seq_len)                         # Modeli eğit ve normalize tahmin al
+                                y_pred_h = sc_y.inverse_transform(pred_sc).ravel()      # Tahmini orijinal ölçeğe çevir
+                                y_true_h = y_test[target_col_h].values[seq_len - 1:]    # Karşılık gelen gerçek test değerleri
+
+                            y_pred_h = np.clip(y_pred_h, 0, 100)                         # Tahminleri [0, 100] aralığına sınırla
+                            rmse_h   = np.sqrt(mean_squared_error(y_true_h, y_pred_h))   # RMSE (kök ortalama kare hata) hesapla
+                            mae_h    = mean_absolute_error(y_true_h, y_pred_h)            # MAE (ortalama mutlak hata) hesapla
+                            r2_h     = r2_score(y_true_h, y_pred_h)                      # R² (belirtme katsayısı) hesapla
+                            horizon_metrics[label] = {"rmse": rmse_h, "mae": mae_h, "r2": r2_h}  # Bu horizonun metriklerini kaydet
+                            print(f"R²={r2_h:.4f}", flush=True)                          # R² değerini konsola yazdır
+
+                        if len(horizon_metrics) == 3:      # Tüm 3 horizon için metrikler hesaplandıysa
+                            results_all.append({            # Sonuçlar listesine bu kombinasyonun tüm metriklerini ekle
+                                "Dam":          dam,
+                                "Strategy":     strategy_label,
+                                "Model":        model_type,
+                                "LagConfig":    lag_name,
+                                "SeqConfig":    seq_name,
+                                "Halflife":     halflife,
+                                "HiddenSize":   64,
+                                "RMSE +7d (%)": round(horizon_metrics["+7d"]["rmse"],  2),   # 7 günlük RMSE
+                                "MAE +7d (%)":  round(horizon_metrics["+7d"]["mae"],   2),   # 7 günlük MAE
+                                "R2 +7d":       round(horizon_metrics["+7d"]["r2"],    4),   # 7 günlük R²
+                                "RMSE +14d (%)":round(horizon_metrics["+14d"]["rmse"], 2),  # 14 günlük RMSE
+                                "MAE +14d (%)": round(horizon_metrics["+14d"]["mae"],  2),  # 14 günlük MAE
+                                "R2 +14d":      round(horizon_metrics["+14d"]["r2"],   4),  # 14 günlük R²
+                                "RMSE +30d (%)":round(horizon_metrics["+30d"]["rmse"], 2),  # 30 günlük RMSE
+                                "MAE +30d (%)": round(horizon_metrics["+30d"]["mae"],  2),  # 30 günlük MAE
+                                "R2 +30d":      round(horizon_metrics["+30d"]["r2"],   4),  # 30 günlük R²
+                            })
+
+                            # Mark done and save checkpoint after every completed combo
+                            done_combos.add(ck)                              # Tamamlanan kombinasyonu kümeye ekle
+                            pd.DataFrame(results_all).to_csv(
+                                f"{OUT_DIR}/search_results_intermediate.csv", index=False)  # Ara sonuçları CSV'ye kaydet (kontrol noktası)
+
+# =========================
+# OUTPUT
+# =========================
+
+total_time = time.time() - start_time                       # Toplam çalışma süresini hesapla
+print(f"\nTotal search time: {total_time/3600:.2f}h")       # Toplam süreyi saat cinsinden yazdır
+
+df_results = pd.DataFrame(results_all)                      # Tüm sonuçları DataFrame'e dönüştür
+
+# --- Full results CSV (every combination) ---
+full_csv = f"{OUT_DIR}/search_results_full.csv"                                 # Tam sonuçlar CSV dosyasının yolu
+df_results.sort_values("R2 +30d", ascending=False).to_csv(full_csv, index=False)  # 30 günlük R²'ye göre sırala ve kaydet
+print(f"\nFull results saved to: {full_csv}")                                   # Kaydedilen dosya yolunu yazdır
+
+# --- Leaderboard: best 30d R² per dam ---
+leaderboard = (
+    df_results
+    .sort_values("R2 +30d", ascending=False)      # 30 günlük R²'ye göre büyükten küçüğe sırala
+    .groupby("Dam")                               # Baraj bazında grupla
+    .first()                                      # Her baraj için en iyi sonucu al
+    .reset_index()                                # Baraj indeksini sütuna geri çevir
+    .sort_values("R2 +30d", ascending=False)      # Tekrar sırala (groupby sonrası sıra bozulabilir)
+)
+
+leaderboard_csv = f"{OUT_DIR}/search_leaderboard.csv"   # Liderlik tablosu CSV dosyasının yolu
+leaderboard.to_csv(leaderboard_csv, index=False)        # Liderlik tablosunu CSV'ye kaydet
+
+# --- Pretty print leaderboard ---
+sep = "=" * 110                                         # Ayırıcı çizgi karakteri
+print(f"\n{sep}")                                        # Üst ayırıcı çizgi
+print("  LEADERBOARD — BEST CONFIG PER DAM  (sorted by R² +30d)")  # Başlık
+print(sep)                                              # Alt ayırıcı çizgi
+print(f"  {'Dam':<20} {'Strategy':<20} {'Model':<6} {'LagCfg':<16} {'SeqCfg':<16} "
+      f"{'HL':>5} {'Hid':>4}  "
+      f"{'R²+7d':>7} {'R²+14d':>7} {'R²+30d':>7}")    # Sütun başlıklarını hizalı yazdır
+print("-" * 110)                                        # Başlık-içerik ayırıcısı
+for _, row in leaderboard.iterrows():                   # Her barajın en iyi sonucunu yazdır
+    print(f"  {row['Dam']:<20} {row['Strategy']:<20} {row['Model']:<6} "
+          f"{row['LagConfig']:<16} {row['SeqConfig']:<16} "
+          f"{int(row['Halflife']):>5} {int(row['HiddenSize']):>4}  "
+          f"{row['R2 +7d']:>7.4f} {row['R2 +14d']:>7.4f} {row['R2 +30d']:>7.4f}")  # Satır bilgilerini hizalı biçimde yazdır
+print(sep)                                              # Kapanış ayırıcı çizgi
+
+# --- Full results table (console) ---
+print(f"\n{'=' * 110}")                                 # Tam sonuçlar bölümü başlığı üstü
+print("  FULL RESULTS — ALL COMBINATIONS (sorted by R² +30d)")  # Tam sonuçlar başlığı
+print(f"{'=' * 110}")                                   # Başlık altı ayırıcı
+df_display = df_results.sort_values("R2 +30d", ascending=False)  # Sonuçları R²'ye göre sırala
+print(df_display.to_string(index=False))                # Tüm sonuçları konsola yazdır (indeks olmadan)
+
+print(f"\nLeaderboard saved to : {leaderboard_csv}")    # Liderlik tablosu dosya yolunu yazdır
+print(f"Full results saved to: {full_csv}")             # Tam sonuçlar dosya yolunu yazdır
